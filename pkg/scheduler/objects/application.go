@@ -66,7 +66,7 @@ const (
 	NotEnoughQueueQuota = "Not enough queue quota"
 )
 
-type GPUUtilization struct {
+type GPUMetric struct {
 	Hostname  string  `json:"hostname"`
 	UUID      string  `json:"uuid"`
 	Device    string  `json:"device"`
@@ -78,6 +78,20 @@ type GPUUtilization struct {
 	VGPU      bool    `json:"vgpu"`
 	Value     float64 `json:"value"`
 }
+
+type GPUInfo struct {
+	ModelName string  `json:"modelName"`
+	Node      string  `json:"node"`
+	Value     float64 `json:"value"`
+}
+
+type GPUTotalUtil struct {
+	TotalVGPUValue float64
+	Count          int
+	Node           string
+}
+
+type GPUTotalUtilMap map[string]GPUTotalUtil
 
 type PlaceholderData struct {
 	TaskGroupName string
@@ -999,13 +1013,17 @@ func (sa *Application) tryAllocate(headRoom *resources.Resource, allowPreemption
 		request.setHeadroomCheckPassed(sa.queuePath)
 
 		requiredNode := request.GetRequiredNode()
+		fmt.Printf("EvenTest requiredNode1 %s", requiredNode)
+		// Get GPU metrics info and filter the best node for better GPU Utilization.
+		if requiredNode == "" {
+			requiredNode = queryGPUMetricToFilterNode()
+			fmt.Println("EvenTest requiredNode:", requiredNode)
+		}
 
-		testGPUNode()
 		// does request have any constraint to run on specific node?
 		if requiredNode != "" {
 			// the iterator might not have the node we need as it could be reserved, or we have not added it yet
 			node := getNodeFn(requiredNode)
-			fmt.Printf("EvenTest node %s", node.NodeID)
 			if node == nil {
 				getRateLimitedAppLog().Info("required node is not found (could be transient)",
 					zap.String("application ID", sa.ApplicationID),
@@ -1500,7 +1518,82 @@ func (sa *Application) tryNodes(ask *AllocationAsk, iterator NodeIterator) *Allo
 	return nil
 }
 
-func testGPUNode() (node *Node) {
+func queryGPUMetricToFilterNode() (nodeName string) {
+
+	result := queryGPUMetrics()
+	if result == nil {
+		return ""
+	}
+	gpuTotalUtilMap := getGpuTotalUtilMap(result)
+
+	fmt.Println("EvenTest gpuTotalUtilMap", gpuTotalUtilMap)
+	nodeName = getSuitableGPUNode(gpuTotalUtilMap)
+	fmt.Println("EvenTest nodeName", nodeName)
+	if nodeName != "" {
+		return nodeName
+	}
+
+	return ""
+}
+
+func getGpuTotalUtilMap(result model.Value) GPUTotalUtilMap {
+	// Parse the result into the struct
+	var gpuMetrics []GPUMetric
+	vector, ok := result.(model.Vector)
+	if !ok {
+		fmt.Println("Unexpected result format")
+	}
+
+	for _, sample := range vector {
+		metric := sample.Metric
+		value := sample.Value
+
+		vgpu := false
+		if val, ok := metric["vgpu"]; ok && string(val) == "true" {
+			vgpu = true
+		}
+
+		gpuMetric := GPUMetric{
+			Hostname:  string(metric["Hostname"]),
+			UUID:      string(metric["UUID"]),
+			Device:    string(metric["device"]),
+			GPU:       string(metric["gpu"]),
+			Instance:  string(metric["instance"]),
+			Job:       string(metric["job"]),
+			ModelName: string(metric["modelName"]),
+			Node:      string(metric["node"]),
+			VGPU:      vgpu,
+			Value:     float64(value),
+		}
+
+		gpuMetrics = append(gpuMetrics, gpuMetric)
+	}
+
+	gpuTotalUtilMap := make(GPUTotalUtilMap)
+
+	// Print the parsed structs
+	for _, gpuMetric := range gpuMetrics {
+		// sum up the vGPU's utilization.
+		if gpuMetric.VGPU {
+			gpu, exists := gpuTotalUtilMap[gpuMetric.ModelName]
+			if !exists {
+				gpu = struct {
+					TotalVGPUValue float64
+					Count          int
+					Node           string
+				}{}
+			}
+			gpu.TotalVGPUValue += gpuMetric.Value
+			gpu.Count++
+			gpu.Node = gpuMetric.Node
+			gpuTotalUtilMap[gpuMetric.ModelName] = gpu
+		}
+		log.Log(log.SchedApplication).Info("GPU Utilization for Node", zap.Any("GPU Utilization", gpuMetric))
+	}
+	return gpuTotalUtilMap
+}
+
+func queryGPUMetrics() model.Value {
 	client, err := api.NewClient(api.Config{
 		// Address: "http://prometheus-service.prometheus.svc.cluster.local",
 		Address: "http://10.234.10.28",
@@ -1529,45 +1622,40 @@ func testGPUNode() (node *Node) {
 		log.Log(log.SchedApplication).Warn("Prometheus query warnings",
 			zap.Strings("warnings", warnings))
 	}
+	return result
+}
 
-	// Parse the result into the struct
-	var gpuUtilizations []GPUUtilization
-	vector, ok := result.(model.Vector)
-	if !ok {
-		fmt.Println("Unexpected result format")
+func getSuitableGPUNode(gpuTotalUtil GPUTotalUtilMap) string {
+	var gpuInfos = []GPUInfo{}
+	for modelName, gpu := range gpuTotalUtil {
+		gpuInfo := GPUInfo{
+			ModelName: modelName,
+			Node:      gpu.Node,
+			Value:     gpu.TotalVGPUValue / float64(gpu.Count),
+		}
+		gpuInfos = append(gpuInfos, gpuInfo)
 	}
 
-	for _, sample := range vector {
-		metric := sample.Metric
-		value := sample.Value
+	fmt.Println("EventTest gpuInfos: ", gpuInfos)
 
-		vgpu := false
-		if val, ok := metric["vgpu"]; ok && string(val) == "true" {
-			vgpu = true
+	// choose the best node to assign the GPU into specified node.
+	for _, gpuInfo := range gpuInfos {
+		if (gpuInfo.Value) > 70 {
+			continue
 		}
 
-		gpuUtil := GPUUtilization{
-			Hostname:  string(metric["Hostname"]),
-			UUID:      string(metric["UUID"]),
-			Device:    string(metric["device"]),
-			GPU:       string(metric["gpu"]),
-			Instance:  string(metric["instance"]),
-			Job:       string(metric["job"]),
-			ModelName: string(metric["modelName"]),
-			Node:      string(metric["node"]),
-			VGPU:      vgpu,
-			Value:     float64(value),
+		if gpuInfo.Value > 0 && gpuInfo.Value < 70 {
+			return gpuInfo.Node
 		}
-
-		gpuUtilizations = append(gpuUtilizations, gpuUtil)
 	}
 
-	// Print the parsed structs
-	for _, util := range gpuUtilizations {
-		fmt.Printf("GPU Utilization: %+v\n", util)
-		log.Log(log.SchedApplication).Info("GPU Utilization for Node", zap.Any("GPU Utilization", util))
+	// If no suitable GPU found, fallback to scheduling on the same GPU
+	for _, gpuInfo := range gpuInfos {
+		if gpuInfo.Value == 0 {
+			return gpuInfo.Node
+		}
 	}
-	return nil
+	return ""
 }
 
 // Try allocating on one specific node
