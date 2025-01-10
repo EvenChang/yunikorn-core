@@ -42,6 +42,9 @@ import (
 	"github.com/apache/yunikorn-core/pkg/scheduler/ugm"
 	siCommon "github.com/apache/yunikorn-scheduler-interface/lib/go/common"
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
+	"github.com/prometheus/client_golang/api"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
 )
 
 var (
@@ -62,6 +65,19 @@ const (
 	NotEnoughUserQuota  = "Not enough user quota"
 	NotEnoughQueueQuota = "Not enough queue quota"
 )
+
+type GPUUtilization struct {
+	Hostname  string  `json:"hostname"`
+	UUID      string  `json:"uuid"`
+	Device    string  `json:"device"`
+	GPU       string  `json:"gpu"`
+	Instance  string  `json:"instance"`
+	Job       string  `json:"job"`
+	ModelName string  `json:"modelName"`
+	Node      string  `json:"node"`
+	VGPU      bool    `json:"vgpu"`
+	Value     float64 `json:"value"`
+}
 
 type PlaceholderData struct {
 	TaskGroupName string
@@ -983,10 +999,13 @@ func (sa *Application) tryAllocate(headRoom *resources.Resource, allowPreemption
 		request.setHeadroomCheckPassed(sa.queuePath)
 
 		requiredNode := request.GetRequiredNode()
+
+		testGPUNode()
 		// does request have any constraint to run on specific node?
 		if requiredNode != "" {
 			// the iterator might not have the node we need as it could be reserved, or we have not added it yet
 			node := getNodeFn(requiredNode)
+			fmt.Printf("EvenTest node %s", node.NodeID)
 			if node == nil {
 				getRateLimitedAppLog().Info("required node is not found (could be transient)",
 					zap.String("application ID", sa.ApplicationID),
@@ -1019,6 +1038,7 @@ func (sa *Application) tryAllocate(headRoom *resources.Resource, allowPreemption
 					zap.Stringer("AllocationResult", alloc.GetResult()))
 				return alloc
 			}
+			fmt.Println("EvenTest ReservedAllocation")
 			return newReservedAllocation(node.NodeID, request)
 		}
 
@@ -1267,6 +1287,7 @@ func (sa *Application) tryReservedAllocate(headRoom *resources.Resource, nodeIte
 			}
 		}
 		// check allocation possibility
+		fmt.Println("EvenTest reserve.node:", reserve.node)
 		alloc := sa.tryNode(reserve.node, ask)
 
 		// allocation worked fix the result and return
@@ -1350,7 +1371,10 @@ func (sa *Application) tryRequiredNodePreemption(reserve *reservation, ask *Allo
 // This should never result in a reservation as the ask is already reserved
 func (sa *Application) tryNodesNoReserve(ask *AllocationAsk, iterator NodeIterator, reservedNode string) *Allocation {
 	var allocResult *Allocation
+
+	fmt.Println("EvenTest tryNodesNoReserve ")
 	iterator.ForEachNode(func(node *Node) bool {
+		fmt.Println("EvenTest tryNodesNoReserve :", node.NodeID)
 		if !node.IsSchedulable() {
 			log.Log(log.SchedApplication).Debug("skipping node for reserved ask as state is unschedulable",
 				zap.String("allocationKey", ask.GetAllocationKey()),
@@ -1473,6 +1497,76 @@ func (sa *Application) tryNodes(ask *AllocationAsk, iterator NodeIterator) *Allo
 		return alloc
 	}
 	// ask does not fit, skip to next ask
+	return nil
+}
+
+func testGPUNode() (node *Node) {
+	client, err := api.NewClient(api.Config{
+		// Address: "http://prometheus-service.prometheus.svc.cluster.local",
+		Address: "http://10.234.10.28",
+	})
+	if err != nil {
+		log.Log(log.SchedApplication).Error("Failed to create Prometheus client",
+			zap.Error(err))
+		return nil
+	}
+
+	promAPI := v1.NewAPI(client)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Query Prometheus for GPU Utilization of the specific node
+	// query := fmt.Sprintf(`DCGM_FI_DEV_GPU_UTIL{node="%s"}`, node.NodeID)
+	query := `DCGM_FI_DEV_GPU_UTIL`
+	result, warnings, err := promAPI.Query(ctx, query, time.Now())
+	if err != nil {
+		log.Log(log.SchedApplication).Error("Prometheus query failed",
+			zap.Error(err))
+		return nil
+	}
+
+	if len(warnings) > 0 {
+		log.Log(log.SchedApplication).Warn("Prometheus query warnings",
+			zap.Strings("warnings", warnings))
+	}
+
+	// Parse the result into the struct
+	var gpuUtilizations []GPUUtilization
+	vector, ok := result.(model.Vector)
+	if !ok {
+		fmt.Println("Unexpected result format")
+	}
+
+	for _, sample := range vector {
+		metric := sample.Metric
+		value := sample.Value
+
+		vgpu := false
+		if val, ok := metric["vgpu"]; ok && string(val) == "true" {
+			vgpu = true
+		}
+
+		gpuUtil := GPUUtilization{
+			Hostname:  string(metric["Hostname"]),
+			UUID:      string(metric["UUID"]),
+			Device:    string(metric["device"]),
+			GPU:       string(metric["gpu"]),
+			Instance:  string(metric["instance"]),
+			Job:       string(metric["job"]),
+			ModelName: string(metric["modelName"]),
+			Node:      string(metric["node"]),
+			VGPU:      vgpu,
+			Value:     float64(value),
+		}
+
+		gpuUtilizations = append(gpuUtilizations, gpuUtil)
+	}
+
+	// Print the parsed structs
+	for _, util := range gpuUtilizations {
+		fmt.Printf("GPU Utilization: %+v\n", util)
+		log.Log(log.SchedApplication).Info("GPU Utilization for Node", zap.Any("GPU Utilization", util))
+	}
 	return nil
 }
 
